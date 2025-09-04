@@ -1,0 +1,195 @@
+#+TITLE: HERO SDK — Docker Build & Compile Guide
+#+AUTHOR: Fabricio Puente M.
+#+OPTIONS: toc:3 num:t
+#+PROPERTY: header-args:shell :results verbatim :exports code
+
+* Overview
+This guide shows how to:
+- Build a Docker image for the HERO toolchains and SDK.
+- Run a container with the right mounts and user mapping.
+- Compile the HERO components (toolchains, SDKs, LLVM) inside the container.
+
+The image is based on ~ubuntu:18.04~ and creates a non-root user (~dockeruser~) whose UID/GID match your host, so files written to mounted volumes are owned by you.
+
+* Prerequisites
+- Docker installed and working on the host.
+- This repository checked out locally (containing the ~Dockerfile~ you shared).
+- Enough disk space for toolchains, SDKs, and build artifacts (several GB).
+
+** Initialize submodules (first time only)
+#+begin_src shell
+  cd hero
+  git submodule update --init --recursive
+#+end_src
+
+* Build the Docker Image
+#+begin_src shell
+  # From the repository root (where the Dockerfile lives)
+  docker build \
+    --no-cache \
+    --build-arg UID=$(id -u) \
+    --build-arg GID=$(id -g) \
+    -t hero-sdk-ubuntu:1.0 .
+#+end_src
+
+** Notes
+- ~UID/GID~ mapping prevents root-owned files in your workspace.
+- The image sets ~ENV HERO_INSTALL=/home/dockeruser/hero/install~.
+
+* Choose Your Workflow
+There are two good ways to work with the source and output:
+
+** Option A: Bind-mount only the ~install/~ output
+Use the baked-in source from the image (copied during ~docker build~) and keep only the ~install/~ directory on the host. Rebuild the image whenever you change sources on the host.
+
+#+begin_src shell
+  # Creates ./install on host and maps it to HERO_INSTALL in the container
+  mkdir -p install
+  docker run -it --rm \
+    -v "$(pwd)/install":/home/dockeruser/hero/install \
+    hero-sdk-ubuntu:1.0
+#+end_src
+
+** Option B (recommended for iteration): Bind-mount the whole repo
+Work directly on your host files; no image rebuild needed for source changes.
+
+#+begin_src shell
+  # Map the entire repo (read-write) + preserve install artifacts on host
+  docker run -it --rm \
+    -v "$(pwd)":/home/dockeruser/hero \
+    -w /home/dockeruser/hero \
+    hero-sdk-ubuntu:1.0
+#+end_src
+
+* Inside the Container
+When the shell opens, you’ll be ~dockeruser~ with ~WORKDIR=/home/dockeruser~ (or your bind-mounted repo if you used Option B).
+
+** Quick sanity checks
+#+begin_src shell
+  whoami
+  pwd
+  printenv HERO_INSTALL
+  ls -la hero
+#+end_src
+
+* (Optional) PREM Support
+If you want PREM support (see upstream notes), enable it *before* building SDK/toolchains:
+
+#+begin_src shell
+  cd hero
+  make prem-set
+  # To disable later:
+  # make prem-unset
+#+end_src
+
+* Build Steps
+You can run these targets individually or as a sequence. Use parallel make to speed things up on multi-core machines.
+
+#+begin_src shell
+  # 1) Accelerator toolchain (PULP)
+  cd hero
+  make -j"$(nproc)" tc-pulp
+
+  # 2) PULP SDK (required before host SDKs)
+  make -j"$(nproc)" sdk-pulp
+
+  # 3) Host SDKs (choose according to your target; both shown)
+  make -j"$(nproc)" sdk-hrv   # RISC-V host SDK
+  make -j"$(nproc)" sdk-har   # ARMv8 host SDK
+
+  # 4) Heterogeneous LLVM Toolchain
+  make -j"$(nproc)" tc-llvm
+#+end_src
+
+** Notes
+- ~tc-llvm~ builds Clang/LLVM with HERO’s heterogeneous support. The PULP offloading plugin (~libomptarget.rtl.pulp.so~) is not built here; it’s built as part of the host SDK packages. You can safely ignore messages like:
+  =LIBOMPTARGET: Not building PULP offloading plugin: build disabled.=
+
+* Target-Specific Environments
+
+** Xilinx ZCU102 (ARMv8 host)
+After building toolchains/SDKs, prepare the Buildroot-based environment and images:
+
+#+begin_src shell
+  cd hero
+
+  # Point Buildroot at your bitstream in local.cfg (absolute path)
+  # Create local.cfg if it doesn't exist:
+  echo 'BR2_HERO_BITSTREAM=/absolute/path/to/hero_exilzcu102_wrapper.bit' >> local.cfg
+
+  # Build SD card image + boot files (invokes PetaLinux as required)
+  make -j"$(nproc)" br-har-exilzcu102
+#+end_src
+
+Follow the upstream flow for SD card partitioning, copying ~BOOT.BIN~ and ~image.ub~, setting up SSH (~dropbear~), and mounting persistent partitions. (See original README for the details you pasted.)
+
+** QEMU (RISC-V host) — optional
+#+begin_src shell
+  cd hero
+  make -j"$(nproc)" br-hrv-eqemu
+  # Then boot with qemu-system-riscv64 as documented in README.
+#+end_src
+
+* Environment Setup for App Development
+For day-to-day builds of apps and libs, source the environment for your target:
+
+#+begin_src shell
+  # Example (names depend on your repo's env/ directory):
+  source env/exilzcu102.sh
+  # or for RTL sim:
+  # source env/esim-exilzcu102.sh
+#+end_src
+
+Now standard ~Makefile~-based builds of examples/apps should pick up the right compilers and paths (thanks to ~HERO_INSTALL~ and the env script).
+
+* Common Commands (Cheat Sheet)
+#+begin_src shell
+  # Rebuild a single target with logs:
+  make V=1 <target>
+
+  # Clean outputs for a target:
+  make <target>-clean
+
+  # Show where things are installed:
+  echo "$HERO_INSTALL"
+  tree -L 2 "$HERO_INSTALL" || ls -la "$HERO_INSTALL"
+#+end_src
+
+* Troubleshooting
+
+** Permissions on host files
+If you see permission issues on your host:
+- Ensure you passed ~--build-arg UID=$(id -u) --build-arg GID=$(id -g)~ at image build time.
+- Prefer Option B (bind-mount whole repo) so the container writes as your UID/GID.
+
+** Re-running installs but nothing changes
+Some targets are cached. Try the corresponding ~-clean~ target or remove the package’s build dir under ~install/~.
+
+** Network hiccups / retries
+Transient fetch failures (git or package downloads) can occur. Re-run the ~make~ target; most build recipes are idempotent.
+
+** Using alternative mirrors
+Ubuntu 18.04 is EOL; base image already points to old-releases mirrors. If an ~apt~ step ever fails due to mirrors, rebuild later or switch to a newer base image (requires adapting packages).
+
+* Host ↔ Container File Layout (when bind-mounting repo)
+- Host repo root → ~~/hero~ in container.
+- ~install/~ directory → ~${HERO_INSTALL}~ (~~/hero/install~) inside container.
+
+* Clean Up
+#+begin_src shell
+  # Remove dangling images/containers (optional housekeeping):
+  docker system prune
+#+end_src
+
+* Appendix: One-Liners
+
+** Full “fresh” workflow (bind-mount repo; recommended)
+#+begin_src shell
+  # On host (from repo root)
+  docker build --build-arg UID=$(id -u) --build-arg GID=$(id -g) -t hero-sdk-ubuntu:1.0 .
+  docker run -it --rm -v "$(pwd)":/home/dockeruser/hero -w /home/dockeruser/hero hero-sdk-ubuntu:1.0
+
+  # Inside container
+  git submodule update --init --recursive
+  make -j"$(nproc)" tc-pulp sdk-pulp sdk-hrv sdk-har tc-llvm
+#+end_src
